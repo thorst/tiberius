@@ -1,5 +1,21 @@
 # Changes
 
+## Unreleased
+
+- feat: Windows authentication on Windows (`winauth`) uses SSPI's `Negotiate`
+  package instead of `NTLM`, for both `AuthMethod::Integrated` and
+  `AuthMethod::Windows`: Kerberos when the server's SPN (`MSSQLSvc/host:port`)
+  is registered, NTLM otherwise, as ODBC and ADO.NET do. A named account now
+  goes through SSPI too (its credentials passed to `AcquireCredentialsHandleW`)
+  rather than an NTLMv2 implementation in Rust. The login exchanges SSPI tokens
+  until the context is complete (Kerberos with mutual authentication finishes in
+  fewer legs than NTLM's three) and sends follow-up tokens in SSPI messages
+  (packet type 0x11), as the integrated path already did. The `winauth` crate
+  is replaced by `windows-sys`.
+- chore: `sspi` 0.18 → 0.23 for `sspi-rs`: 0.18 pins `crypto-bigint
+  =0.7.0-rc.18`, which can't resolve next to crates needing `^0.7.3` (russh
+  0.64, for example). No code change was needed.
+
 ## Version 0.13.0
 
 - feat: TLS trust configuration is revamped around two orthogonal axes plus a

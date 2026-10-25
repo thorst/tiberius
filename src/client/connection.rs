@@ -46,7 +46,7 @@ use std::{cmp, fmt::Debug, io, pin::Pin, task};
 use task::Poll;
 use tracing::{event, Level};
 #[cfg(all(windows, feature = "winauth"))]
-use winauth::{windows::NtlmSspiBuilder, NextBytes};
+use crate::client::negotiate::{Account, Negotiate};
 use zeroize::{Zeroize, Zeroizing};
 
 /// A `Connection` is an abstraction between the [`Client`] and the server. It
@@ -588,35 +588,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         match auth {
             #[cfg(all(windows, feature = "winauth"))]
             AuthMethod::Integrated => {
-                let mut client = NtlmSspiBuilder::new()
-                    .target_spn(self.context.spn())
-                    .build()?;
-
-                login_message.integrated_security(client.next_bytes(None)?);
-
-                let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
-
-                self = self.post_login_encryption(encryption);
-
-                let sspi_bytes = self.flush_sspi().await?;
-
-                match client.next_bytes(Some(sspi_bytes.as_ref()))? {
-                    Some(sspi_response) => {
-                        event!(Level::TRACE, sspi_response_len = sspi_response.len());
-
-                        let id = self.context.next_packet_id();
-                        let header = PacketHeader::sspi(id);
-
-                        let token = TokenSspi::new(sspi_response);
-                        self.send(header, token).await?;
-                    }
-                    None => {
-                        return Err(crate::Error::Protocol(
-                            "NTLM handshake produced no response to the server challenge".into(),
-                        ))
-                    }
-                }
+                let sspi = Negotiate::new(self.context.spn(), None)?;
+                self = self.negotiate(sspi, login_message, encryption).await?;
             }
             #[cfg(all(unix, feature = "integrated-auth-gssapi"))]
             AuthMethod::Integrated => {
@@ -751,48 +724,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             }
             #[cfg(all(windows, feature = "winauth"))]
             AuthMethod::Windows(auth) => {
-                let spn = self.context.spn().to_string();
-                let builder = winauth::NtlmV2ClientBuilder::new().target_spn(spn);
-                // `auth.password` is a `SecretString`, but `winauth`
-                // 0.0.5's `build` takes the password by value as a plain
-                // `String` and neither zeroizes it nor exposes it afterwards, so
-                // it cannot be wiped once handed over. Expose it once for a
-                // single `to_string()` copy (no additional retained plaintext
-                // here) and accept a residual: the plaintext lives inside
-                // the `NtlmV2Client` until that value is dropped, un-zeroized.
-                // Closing this fully requires zeroize support upstream in
-                // `winauth`.
-                let mut client = builder.build(
-                    auth.domain,
-                    auth.user,
-                    auth.password.expose_secret().to_string(),
-                );
-
-                login_message.integrated_security(client.next_bytes(None)?);
-
-                let id = self.context.next_packet_id();
-                self.send(PacketHeader::login(id), login_message).await?;
-
-                self = self.post_login_encryption(encryption);
-
-                let sspi_bytes = self.flush_sspi().await?;
-
-                match client.next_bytes(Some(sspi_bytes.as_ref()))? {
-                    Some(sspi_response) => {
-                        event!(Level::TRACE, sspi_response_len = sspi_response.len());
-
-                        let id = self.context.next_packet_id();
-                        let header = PacketHeader::login(id);
-
-                        let token = TokenSspi::new(sspi_response);
-                        self.send(header, token).await?;
-                    }
-                    None => {
-                        return Err(crate::Error::Protocol(
-                            "NTLM handshake produced no response to the server challenge".into(),
-                        ))
-                    }
-                }
+                // SSPI copies the credentials into its own handle; the UTF-16 copy made for the
+                // call is wiped when `Negotiate::new` returns, and `auth.password` when `auth`
+                // drops.
+                let account = Account {
+                    user: &auth.user,
+                    domain: auth.domain.as_deref(),
+                    password: auth.password.expose_secret(),
+                };
+                let sspi = Negotiate::new(self.context.spn(), Some(account))?;
+                self = self.negotiate(sspi, login_message, encryption).await?;
             }
             AuthMethod::None => {
                 let id = self.context.next_packet_id();
@@ -836,6 +777,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             }
         }
 
+        Ok(self)
+    }
+
+    /// A Windows login through SSPI `Negotiate`: the first token goes in the login message,
+    /// then tokens are exchanged (in SSPI packets) until the context is complete. Kerberos with
+    /// mutual authentication completes on the server's first answer, NTLM after our third
+    /// message. The LOGINACK that follows is read by the caller's `flush_done`.
+    #[cfg(all(windows, feature = "winauth"))]
+    async fn negotiate(
+        mut self,
+        mut sspi: Negotiate,
+        mut login_message: LoginMessage<'_>,
+        encryption: EncryptionLevel,
+    ) -> crate::Result<Self> {
+        let mut step = sspi.step(None)?;
+        login_message.integrated_security(Some(std::mem::take(&mut step.token)));
+        let id = self.context.next_packet_id();
+        self.send(PacketHeader::login(id), login_message).await?;
+        self = self.post_login_encryption(encryption);
+
+        while !step.done {
+            let answer = self.flush_sspi().await?;
+            step = sspi.step(Some(answer.as_ref()))?;
+            event!(Level::TRACE, sspi_response_len = step.token.len(), done = step.done);
+            if !step.token.is_empty() {
+                let id = self.context.next_packet_id();
+                let token = TokenSspi::new(std::mem::take(&mut step.token));
+                self.send(PacketHeader::sspi(id), token).await?;
+            }
+        }
         Ok(self)
     }
 
