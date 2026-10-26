@@ -801,7 +801,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             let answer = self.flush_sspi().await?;
             step = sspi.step(Some(answer.as_ref()))?;
             event!(Level::TRACE, sspi_response_len = step.token.len(), done = step.done);
-            if !step.token.is_empty() {
+            // A server message that ends with its SSPI token waits for our answer, even an empty
+            // one: NTLM inside SPNEGO can end with the server's mechListMIC, which completes our
+            // context with nothing left to send (seen with an integrated login to a SQL Server
+            // on the same machine). Microsoft's drivers always answer it. An SSPI token followed
+            // by the LOGINACK in the same message wants none.
+            if !step.token.is_empty() || self.is_eof() {
                 let id = self.context.next_packet_id();
                 let token = TokenSspi::new(std::mem::take(&mut step.token));
                 self.send(PacketHeader::sspi(id), token).await?;
